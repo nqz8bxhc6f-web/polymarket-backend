@@ -2,6 +2,7 @@ const express = require("express");
 const cors    = require("cors");
 const crypto  = require("crypto");
 const { ethers } = require("ethers");
+const { createClient } = require("@supabase/supabase-js");
 
 const app  = express();
 app.use(cors());
@@ -12,8 +13,12 @@ const API_KEY        = process.env.POLY_API_KEY;
 const API_SECRET     = process.env.POLY_API_SECRET;
 const API_PASSPHRASE = process.env.POLY_API_PASSPHRASE;
 const FUNDER_ADDRESS = process.env.FUNDER_ADDRESS;
+const SUPABASE_URL   = process.env.SUPABASE_URL;
+const SUPABASE_KEY   = process.env.SUPABASE_KEY;
 const CLOB_HOST      = "https://clob.polymarket.com";
 const GAMMA_HOST     = "https://gamma-api.polymarket.com";
+
+const supabase = createClient(SUPABASE_URL, SUPABASE_KEY);
 
 function buildL2Headers(method, path, body = "") {
   const timestamp = Math.floor(Date.now() / 1000).toString();
@@ -34,18 +39,46 @@ async function polyFetch(url, opts = {}) {
   try { return JSON.parse(text); } catch { return { error: text }; }
 }
 
+// Charge tous les marchés depuis Polymarket et les sauvegarde dans Supabase
+async function syncMarkets() {
+  console.log("Synchronisation des marchés...");
+  let allMarkets = [];
+  let offset = 0;
+  while (true) {
+    const params = new URLSearchParams({ limit: 100, offset, order: "volume24hr", ascending: "false" });
+    const data = await polyFetch(`${GAMMA_HOST}/markets?${params}`);
+    if (!data || !Array.isArray(data) || data.length === 0) break;
+    allMarkets = allMarkets.concat(data);
+    if (data.length < 100) break;
+    offset += 100;
+  }
+  // Filtre les marchés actifs uniquement
+  const active = allMarkets.filter(m => m.active && !m.closed);
+  // Sauvegarde dans Supabase
+  const { error } = await supabase.from("markets").upsert(
+    active.map(m => ({ id: m.id, data: m, updated_at: new Date().toISOString() })),
+    { onConflict: "id" }
+  );
+  if (error) console.error("Erreur sync:", error.message);
+  else console.log(`${active.length} marchés synchronisés`);
+}
+
+// Récupère les marchés depuis Supabase (instantané)
 app.get("/markets", async (req, res) => {
   try {
-    const { limit = 100, offset = 0, search = "" } = req.query;
-    const params = new URLSearchParams({
-      limit,
-      offset,
-      order:     "volume24hr",
-      ascending: "false",
-      ...(search ? { question: search } : {}),
-    });
-    const data = await polyFetch(`${GAMMA_HOST}/markets?${params}`);
-    res.json(data);
+    const { search = "" } = req.query;
+    let query = supabase.from("markets").select("data");
+    const { data, error } = await query;
+    if (error) throw new Error(error.message);
+    let markets = data.map(r => r.data);
+    if (search) {
+      const s = search.toLowerCase();
+      markets = markets.filter(m =>
+        (m.question || "").toLowerCase().includes(s) ||
+        (m.slug || "").toLowerCase().includes(s)
+      );
+    }
+    res.json(markets);
   } catch (e) {
     res.status(500).json({ error: e.message });
   }
@@ -65,9 +98,7 @@ app.post("/prices", async (req, res) => {
   try {
     const { tokenIds } = req.body;
     const data = await polyFetch(`${CLOB_HOST}/prices`, {
-      method:  "POST",
-      headers: { "Content-Type": "application/json" },
-      body:    JSON.stringify(tokenIds),
+      method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(tokenIds),
     });
     res.json(data);
   } catch (e) {
@@ -129,9 +160,20 @@ app.delete("/order/:orderId", async (req, res) => {
   }
 });
 
+// Lance une sync manuelle
+app.post("/sync", async (req, res) => {
+  await syncMarkets();
+  res.json({ ok: true });
+});
+
 app.get("/health", (req, res) => {
   res.json({ ok: true, wallet: FUNDER_ADDRESS || "NON CONFIGURÉ", hasKey: !!PRIVATE_KEY, hasAPI: !!API_KEY });
 });
 
 const PORT = process.env.PORT || 3001;
-app.listen(PORT, () => console.log(`Polymarket backend running on :${PORT}`));
+app.listen(PORT, async () => {
+  console.log(`Polymarket backend running on :${PORT}`);
+  // Sync au démarrage puis toutes les heures
+  await syncMarkets();
+  setInterval(syncMarkets, 60 * 60 * 1000);
+});
