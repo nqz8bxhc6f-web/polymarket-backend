@@ -38,7 +38,6 @@ app.get("/markets", async (req, res) => {
   try {
     const { limit = 100, offset = 0, search = "" } = req.query;
     const params = new URLSearchParams({
-      active:    "true",
       limit,
       offset,
       order:     "volume24hr",
