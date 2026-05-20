@@ -1,10 +1,9 @@
 const express = require("express");
-const cors    = require("cors");
-const crypto  = require("crypto");
-const { ethers } = require("ethers");
+const cors = require("cors");
+const crypto = require("crypto");
 const { createClient } = require("@supabase/supabase-js");
 
-const app  = express();
+const app = express();
 app.use(cors());
 app.use(express.json());
 
@@ -18,7 +17,9 @@ const SUPABASE_KEY   = process.env.SUPABASE_KEY;
 const CLOB_HOST      = "https://clob.polymarket.com";
 const GAMMA_HOST     = "https://gamma-api.polymarket.com";
 
-const supabase = createClient(SUPABASE_URL, SUPABASE_KEY);
+const supabase = SUPABASE_URL && SUPABASE_KEY
+  ? createClient(SUPABASE_URL, SUPABASE_KEY)
+  : null;
 
 function buildL2Headers(method, path, body = "") {
   const timestamp = Math.floor(Date.now() / 1000).toString();
@@ -39,46 +40,72 @@ async function polyFetch(url, opts = {}) {
   try { return JSON.parse(text); } catch { return { error: text }; }
 }
 
-// Charge tous les marchés depuis Polymarket et les sauvegarde dans Supabase
-async function syncMarkets() {
-  console.log("Synchronisation des marchés...");
-  let allMarkets = [];
-  let offset = 0;
-  while (true) {
-    const params = new URLSearchParams({ limit: 100, offset, order: "volume24hr", ascending: "false" });
-    const data = await polyFetch(`${GAMMA_HOST}/markets?${params}`);
-    if (!data || !Array.isArray(data) || data.length === 0) break;
-    allMarkets = allMarkets.concat(data);
-    if (data.length < 100) break;
-    offset += 100;
+// Insère les marchés 10 par 10 pour éviter le timeout
+async function insertBatch(markets) {
+  for (let i = 0; i < markets.length; i += 10) {
+    const batch = markets.slice(i, i + 10);
+    try {
+      await supabase.from("markets").upsert(
+        batch.map(m => ({ id: m.id, data: m, updated_at: new Date().toISOString() })),
+        { onConflict: "id" }
+      );
+    } catch(e) {
+      console.log("Erreur insert batch:", e.message);
+    }
+    await new Promise(r => setTimeout(r, 500));
   }
-  // Filtre les marchés actifs uniquement
-  const active = allMarkets.filter(m => m.active && !m.closed);
-  // Sauvegarde dans Supabase
-  const { error } = await supabase.from("markets").upsert(
-    active.map(m => ({ id: m.id, data: m, updated_at: new Date().toISOString() })),
-    { onConflict: "id" }
-  );
-  if (error) console.error("Erreur sync:", error.message);
-  else console.log(`${active.length} marchés synchronisés`);
 }
 
-// Récupère les marchés depuis Supabase (instantané)
+async function syncBatch(offset) {
+  const params = new URLSearchParams({
+    limit: 50, offset,
+    order: "volume24hr", ascending: "false"
+  });
+  const data = await polyFetch(`${GAMMA_HOST}/markets?${params}`);
+  if (!data || !Array.isArray(data) || data.length === 0) return 0;
+  const active = data.filter(m => m.active && !m.closed);
+  if (supabase && active.length > 0) {
+    await insertBatch(active);
+  }
+  console.log(`Synced ${active.length} markets at offset ${offset}`);
+  return data.length;
+}
+
+async function syncAll() {
+  console.log("Démarrage sync...");
+  let offset = 0;
+  while (true) {
+    const count = await syncBatch(offset);
+    if (count < 50) break;
+    offset += 50;
+    await new Promise(r => setTimeout(r, 3000));
+  }
+  console.log("Sync terminée !");
+}
+
 app.get("/markets", async (req, res) => {
   try {
-    const { search = "" } = req.query;
-    let query = supabase.from("markets").select("data");
-    const { data, error } = await query;
-    if (error) throw new Error(error.message);
-    let markets = data.map(r => r.data);
-    if (search) {
-      const s = search.toLowerCase();
-      markets = markets.filter(m =>
-        (m.question || "").toLowerCase().includes(s) ||
-        (m.slug || "").toLowerCase().includes(s)
-      );
+    const { search = "", limit = 100, offset = 0 } = req.query;
+    if (supabase) {
+      const { data, error } = await supabase
+        .from("markets")
+        .select("data")
+        .range(+offset, +offset + +limit - 1);
+      if (error) throw new Error(error.message);
+      let markets = data.map(r => r.data);
+      if (search) {
+        const s = search.toLowerCase();
+        markets = markets.filter(m =>
+          (m.question || "").toLowerCase().includes(s) ||
+          (m.slug || "").toLowerCase().includes(s)
+        );
+      }
+      res.json(markets);
+    } else {
+      const params = new URLSearchParams({ limit, offset, order: "volume24hr", ascending: "false" });
+      const data = await polyFetch(`${GAMMA_HOST}/markets?${params}`);
+      res.json(data);
     }
-    res.json(markets);
   } catch (e) {
     res.status(500).json({ error: e.message });
   }
@@ -89,9 +116,7 @@ app.get("/price/:tokenId", async (req, res) => {
     const { side = "BUY" } = req.query;
     const data = await polyFetch(`${CLOB_HOST}/price?token_id=${req.params.tokenId}&side=${side}`);
     res.json(data);
-  } catch (e) {
-    res.status(500).json({ error: e.message });
-  }
+  } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
 app.post("/prices", async (req, res) => {
@@ -101,79 +126,60 @@ app.post("/prices", async (req, res) => {
       method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(tokenIds),
     });
     res.json(data);
-  } catch (e) {
-    res.status(500).json({ error: e.message });
-  }
+  } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
 app.get("/orderbook/:tokenId", async (req, res) => {
   try {
     const data = await polyFetch(`${CLOB_HOST}/book?token_id=${req.params.tokenId}`);
     res.json(data);
-  } catch (e) {
-    res.status(500).json({ error: e.message });
-  }
+  } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
 app.get("/positions", async (req, res) => {
   try {
-    const path    = `/data/positions?user=${FUNDER_ADDRESS}&sizeThreshold=0`;
-    const headers = buildL2Headers("GET", path);
-    const data    = await polyFetch(`${CLOB_HOST}${path}`, { headers });
+    const path = `/data/positions?user=${FUNDER_ADDRESS}&sizeThreshold=0`;
+    const data = await polyFetch(`${CLOB_HOST}${path}`, { headers: buildL2Headers("GET", path) });
     res.json(data);
-  } catch (e) {
-    res.status(500).json({ error: e.message });
-  }
+  } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
 app.get("/orders", async (req, res) => {
   try {
-    const path    = `/orders?maker_address=${FUNDER_ADDRESS}`;
-    const headers = buildL2Headers("GET", path);
-    const data    = await polyFetch(`${CLOB_HOST}${path}`, { headers });
+    const path = `/orders?maker_address=${FUNDER_ADDRESS}`;
+    const data = await polyFetch(`${CLOB_HOST}${path}`, { headers: buildL2Headers("GET", path) });
     res.json(data);
-  } catch (e) {
-    res.status(500).json({ error: e.message });
-  }
+  } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
 app.get("/trades", async (req, res) => {
   try {
-    const path    = `/data/trades?maker_address=${FUNDER_ADDRESS}&limit=50`;
-    const headers = buildL2Headers("GET", path);
-    const data    = await polyFetch(`${CLOB_HOST}${path}`, { headers });
+    const path = `/data/trades?maker_address=${FUNDER_ADDRESS}&limit=50`;
+    const data = await polyFetch(`${CLOB_HOST}${path}`, { headers: buildL2Headers("GET", path) });
     res.json(data);
-  } catch (e) {
-    res.status(500).json({ error: e.message });
-  }
+  } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
 app.delete("/order/:orderId", async (req, res) => {
   try {
-    const path    = `/order`;
-    const body    = JSON.stringify({ orderID: req.params.orderId });
-    const headers = buildL2Headers("DELETE", path, body);
-    const data    = await polyFetch(`${CLOB_HOST}${path}`, { method: "DELETE", headers, body });
+    const path = `/order`;
+    const body = JSON.stringify({ orderID: req.params.orderId });
+    const data = await polyFetch(`${CLOB_HOST}${path}`, { method: "DELETE", headers: buildL2Headers("DELETE", path, body), body });
     res.json(data);
-  } catch (e) {
-    res.status(500).json({ error: e.message });
-  }
+  } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
-// Lance une sync manuelle
 app.post("/sync", async (req, res) => {
-  await syncMarkets();
-  res.json({ ok: true });
+  res.json({ ok: true, message: "Sync démarrée" });
+  syncAll().catch(console.error);
 });
 
 app.get("/health", (req, res) => {
-  res.json({ ok: true, wallet: FUNDER_ADDRESS || "NON CONFIGURÉ", hasKey: !!PRIVATE_KEY, hasAPI: !!API_KEY });
+  res.json({ ok: true, wallet: FUNDER_ADDRESS || "NON CONFIGURÉ", hasKey: !!PRIVATE_KEY, hasAPI: !!API_KEY, hasDB: !!supabase });
 });
 
-const PORT = process.env.PORT || 3001;
-app.listen(PORT, async () => {
+const PORT = process.env.PORT || 8080;
+app.listen(PORT, "0.0.0.0", () => {
   console.log(`Polymarket backend running on :${PORT}`);
-  // Sync au démarrage puis toutes les heures
-  await syncMarkets();
-  setInterval(syncMarkets, 60 * 60 * 1000);
+  setTimeout(() => syncAll().catch(console.error), 5000);
 });
