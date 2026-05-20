@@ -40,7 +40,6 @@ async function polyFetch(url, opts = {}) {
   try { return JSON.parse(text); } catch { return { error: text }; }
 }
 
-// Insère les marchés 10 par 10 pour éviter le timeout
 async function insertBatch(markets) {
   for (let i = 0; i < markets.length; i += 10) {
     const batch = markets.slice(i, i + 10);
@@ -50,35 +49,37 @@ async function insertBatch(markets) {
         { onConflict: "id" }
       );
     } catch(e) {
-      console.log("Erreur insert batch:", e.message);
+      console.log("Erreur insert:", e.message);
     }
-    await new Promise(r => setTimeout(r, 500));
+    await new Promise(r => setTimeout(r, 300));
   }
 }
 
-async function syncBatch(offset) {
-  const params = new URLSearchParams({
-    limit: 50, offset,
-    order: "volume24hr", ascending: "false"
-  });
-  const data = await polyFetch(`${GAMMA_HOST}/markets?${params}`);
-  if (!data || !Array.isArray(data) || data.length === 0) return 0;
-  const active = data.filter(m => m.active && !m.closed);
-  if (supabase && active.length > 0) {
-    await insertBatch(active);
-  }
-  console.log(`Synced ${active.length} markets at offset ${offset}`);
-  return data.length;
-}
-
+// Sync uniquement les marchés ACTIFS et supprime les terminés
 async function syncAll() {
-  console.log("Démarrage sync...");
+  console.log("Sync marchés actifs...");
   let offset = 0;
+  let total = 0;
   while (true) {
-    const count = await syncBatch(offset);
-    if (count < 50) break;
+    const params = new URLSearchParams({
+      limit: 50, offset,
+      order: "volume24hr", ascending: "false",
+      active: "true", closed: "false"
+    });
+    const data = await polyFetch(`${GAMMA_HOST}/markets?${params}`);
+    if (!data || !Array.isArray(data) || data.length === 0) break;
+    const active = data.filter(m => m.active && !m.closed);
+    if (supabase && active.length > 0) await insertBatch(active);
+    total += active.length;
+    console.log(`${total} marchés actifs synchronisés`);
+    if (data.length < 50) break;
     offset += 50;
-    await new Promise(r => setTimeout(r, 3000));
+    await new Promise(r => setTimeout(r, 2000));
+  }
+  // Supprime les marchés terminés
+  if (supabase) {
+    await supabase.from("markets").delete().eq("data->>active", "false");
+    await supabase.from("markets").delete().eq("data->>closed", "true");
   }
   console.log("Sync terminée !");
 }
@@ -88,8 +89,7 @@ app.get("/markets", async (req, res) => {
     const { search = "", limit = 100, offset = 0 } = req.query;
     if (supabase) {
       const { data, error } = await supabase
-        .from("markets")
-        .select("data")
+        .from("markets").select("data")
         .range(+offset, +offset + +limit - 1);
       if (error) throw new Error(error.message);
       let markets = data.map(r => r.data);
@@ -180,6 +180,6 @@ app.get("/health", (req, res) => {
 
 const PORT = process.env.PORT || 8080;
 app.listen(PORT, "0.0.0.0", () => {
-  console.log(`Polymarket backend running on :${PORT}`);
-  setTimeout(() => syncAll().catch(console.error), 5000);
-});
+  console.log(`Backend running on :${PORT}`);
+  // Sync au démarrage
+  setTimeout((
